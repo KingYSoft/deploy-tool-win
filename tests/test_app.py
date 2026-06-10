@@ -3,12 +3,15 @@ import hmac
 import json
 import os
 import re
+from datetime import datetime
 
 from fastapi.testclient import TestClient
 
 from webhook_deployer.app import create_app
 from webhook_deployer.config import AppConfig, ProjectConfig, ServerConfig
 from webhook_deployer.deploy import DeployRequest
+from webhook_deployer.logging import TaskLogger
+from webhook_deployer.queue import DeploymentTask
 
 
 async def test_github_webhook_enqueues_matching_project_push():
@@ -73,7 +76,7 @@ def test_github_webhook_rejects_invalid_signature():
     assert response.status_code == 401
 
 
-async def test_log_stream_without_task_id_uses_latest_memory_task(tmp_path):
+async def test_log_stream_without_task_id_uses_latest_finished_memory_task_as_plain_text(tmp_path):
     async def runner(request, logger):
         await logger.write(f"commit={request.commit}")
         return 0
@@ -100,8 +103,10 @@ async def test_log_stream_without_task_id_uses_latest_memory_task(tmp_path):
     response = client.get("/logs/stream?events=1")
 
     assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
     assert "commit=newer" in response.text
     assert "commit=older" not in response.text
+    assert "event: log" not in response.text
 
 
 def test_log_stream_with_missing_task_id_does_not_fallback(tmp_path):
@@ -124,7 +129,7 @@ def test_log_stream_with_missing_task_id_does_not_fallback(tmp_path):
     assert response.status_code == 404
 
 
-def test_log_stream_without_task_id_uses_latest_history_when_queue_empty(tmp_path):
+def test_log_stream_without_task_id_uses_latest_history_as_plain_text_when_queue_empty(tmp_path):
     log_dir = tmp_path / "frontend"
     log_dir.mkdir()
     older = log_dir / "older.log"
@@ -148,8 +153,10 @@ def test_log_stream_without_task_id_uses_latest_history_when_queue_empty(tmp_pat
     response = client.get("/logs/stream?events=1")
 
     assert response.status_code == 200
-    assert '"line": "newer"' in response.text
-    assert '"line": "older"' not in response.text
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "newer" in response.text
+    assert "older" not in response.text
+    assert "event: log" not in response.text
 
 
 def test_log_stream_without_task_id_returns_404_when_no_logs_exist(tmp_path):
@@ -209,6 +216,8 @@ def test_log_stream_returns_html_page_by_default(tmp_path):
     assert 'id="task-links"' in response.text
     assert 'id="log-output"' in response.text
     assert "/logs/stream?events=1" in response.text
+    assert "task.commit || task.finished_at" not in response.text
+    assert "task.finished_at || \"\"" in response.text
 
 
 def test_log_stream_page_closes_event_source_on_end(tmp_path):
@@ -262,8 +271,8 @@ def test_log_stream_history_limits_finished_tasks_to_two_per_project(tmp_path):
     app = create_app(AppConfig(server=ServerConfig(log_dir=str(tmp_path)), projects=projects))
     client = TestClient(app)
 
-    response = client.get("/logs/stream?events=1")
-    snapshot = json.loads(re.search(r"event: snapshot\ndata: (.+)", response.text).group(1))
+    response = client.get("/logs/stream")
+    snapshot = json.loads(re.search(r"let currentSnapshot = (.+);", response.text).group(1))
     projects_seen = [task["project"] for task in snapshot["finished_recent"]]
 
     assert response.status_code == 200
@@ -272,7 +281,42 @@ def test_log_stream_history_limits_finished_tasks_to_two_per_project(tmp_path):
     assert len(snapshot["finished_recent"]) == 4
 
 
-async def test_log_stream_events_include_snapshot_for_concurrent_tasks(tmp_path):
+async def test_log_stream_events_include_snapshot_for_running_task(tmp_path):
+    project = ProjectConfig(
+        name="frontend",
+        repository="owner/frontend",
+        project_type="vue3",
+        branches=["main"],
+        source_dir="C:/src/frontend",
+        webhook_secret="secret",
+        publish_dir="C:/www/frontend",
+    )
+    app = create_app(AppConfig(server=ServerConfig(log_dir=str(tmp_path)), projects={"frontend": project}))
+    client = TestClient(app)
+    logger = TaskLogger(tmp_path / "frontend" / "running.log")
+    await logger.write("running now")
+    await logger.close()
+    task = DeploymentTask(
+        id="running",
+        request=DeployRequest(project, "main", "abc123"),
+        status="running",
+        started_at=datetime.now().astimezone(),
+        logger=logger,
+    )
+    app.state.deployment_queue._tasks[task.id] = task
+
+    response = client.get("/logs/stream?events=1")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "charset=utf-8" in response.headers["content-type"].lower()
+    assert "event: snapshot" in response.text
+    assert '"running"' in response.text
+    assert "event: log" in response.text
+    assert "running now" in response.text
+
+
+async def test_log_stream_events_include_plain_text_for_finished_concurrent_tasks(tmp_path):
     release_a = False
     release_b = False
 
@@ -314,13 +358,13 @@ async def test_log_stream_events_include_snapshot_for_concurrent_tasks(tmp_path)
     response = client.get("/logs/stream?events=1")
 
     assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["content-type"].startswith("text/plain")
     assert "charset=utf-8" in response.headers["content-type"].lower()
-    assert "event: snapshot" in response.text
-    assert '"finished_recent"' in response.text
+    assert "event: snapshot" not in response.text
+    assert "commit=" in response.text
 
 
-async def test_log_stream_events_read_history_by_task_id(tmp_path):
+async def test_log_stream_events_read_history_by_task_id_as_plain_text(tmp_path):
     log_dir = tmp_path / "frontend"
     log_dir.mkdir()
     log_file = log_dir / "abc123.log"
@@ -340,7 +384,8 @@ async def test_log_stream_events_read_history_by_task_id(tmp_path):
     response = client.get("/logs/stream?events=1&task_id=abc123")
 
     assert response.status_code == 200
-    assert "event: log" in response.text
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "event: log" not in response.text
     assert "部署完成" in response.text
 
 
@@ -390,3 +435,4 @@ async def test_log_stream_events_preserve_utf8_chinese(tmp_path):
     assert "部署完成" in response.text
     assert "�" not in response.text
     assert re.search(r"\d{4}-\d{2}-\d{2}T", response.text)
+    assert response.headers["content-type"].startswith("text/plain")

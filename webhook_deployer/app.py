@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 
 from .config import AppConfig
 from .deploy import DeployRequest
@@ -59,7 +59,7 @@ def create_app(config: AppConfig, *, runner: Runner | None = None) -> FastAPI:
     async def stream_logs(task_id: str | None = None, events: str | None = None):
         if events == "1":
             return _stream_log_events(queue, Path(config.server.log_dir), task_id)
-        return HTMLResponse(_logs_page(), media_type="text/html; charset=utf-8")
+        return HTMLResponse(_logs_page(_snapshot_with_history(queue, Path(config.server.log_dir))), media_type="text/html; charset=utf-8")
 
     return app
 
@@ -83,23 +83,23 @@ def _branch_from_ref(ref: str) -> str:
 def _stream_log_events(queue: DeploymentQueue, log_dir: Path, task_id: str | None):
     if task_id:
         task = queue.get(task_id)
-        if task is not None and task.logger is not None:
+        if task is not None and task.status == "running" and task.logger is not None:
             return StreamingResponse(
                 _task_log_stream(task, include_snapshot=False),
                 media_type="text/event-stream; charset=utf-8",
             )
+        if task is not None:
+            log_file = task.logger.log_file if task.logger is not None else _find_log_file(log_dir, task_id)
+            return _plain_log_response(log_file)
 
         log_file = _find_log_file(log_dir, task_id)
         if log_file is None:
             raise HTTPException(status_code=404, detail="task not found")
-        return StreamingResponse(
-            _file_log_stream(log_file, task_id=task_id, project=log_file.parent.name, include_snapshot=False),
-            media_type="text/event-stream; charset=utf-8",
-        )
+        return _plain_log_response(log_file)
 
     snapshot = _snapshot_with_history(queue, log_dir)
     task = queue.latest_task()
-    if task is not None and task.logger is not None:
+    if task is not None and task.status == "running" and task.logger is not None:
         return StreamingResponse(
             _task_log_stream(task, snapshot=snapshot),
             media_type="text/event-stream; charset=utf-8",
@@ -108,10 +108,15 @@ def _stream_log_events(queue: DeploymentQueue, log_dir: Path, task_id: str | Non
     log_file = _latest_log_file(log_dir)
     if log_file is None:
         raise HTTPException(status_code=404, detail="task not found")
-    return StreamingResponse(
-        _file_log_stream(log_file, task_id=log_file.stem, project=log_file.parent.name, snapshot=snapshot),
-        media_type="text/event-stream; charset=utf-8",
-    )
+    return _plain_log_response(log_file)
+
+
+def _plain_log_response(log_file: Path | None):
+    if log_file is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if not log_file.exists():
+        return PlainTextResponse("", media_type="text/plain; charset=utf-8")
+    return PlainTextResponse(log_file.read_text(encoding="utf-8"), media_type="text/plain; charset=utf-8")
 
 
 async def _task_log_stream(
@@ -226,8 +231,9 @@ def _latest_log_file(log_dir: Path) -> Path | None:
     return max(log_files, key=lambda path: path.stat().st_mtime)
 
 
-def _logs_page() -> str:
-    return """<!doctype html>
+def _logs_page(snapshot: dict[str, list[dict[str, object]]]) -> str:
+    initial_snapshot = json.dumps(snapshot, ensure_ascii=False).replace("</", "<\\/")
+    html = """<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -266,6 +272,7 @@ def _logs_page() -> str:
     <pre id="log-output"></pre>
   </main>
   <script>
+    let currentSnapshot = __INITIAL_SNAPSHOT__;
     const statusEl = document.getElementById("status");
     const logEl = document.getElementById("log-output");
     let source = null;
@@ -274,14 +281,25 @@ def _logs_page() -> str:
     function connect(taskId = "") {
       if (source) source.close();
       selectedTask = taskId;
-      const url = taskId ? `/logs/stream?events=1&task_id=${encodeURIComponent(taskId)}` : "/logs/stream?events=1";
       logEl.textContent = "";
+      renderSnapshot(currentSnapshot);
+      const runningTask = taskId ? findTask(currentSnapshot.running || [], taskId) : latestRunningTask();
+      if (runningTask) {
+        connectEvents(taskId);
+      } else {
+        fetchLog(taskId);
+      }
+    }
+
+    function connectEvents(taskId = "") {
+      const url = taskId ? `/logs/stream?events=1&task_id=${encodeURIComponent(taskId)}` : "/logs/stream?events=1";
       statusEl.textContent = taskId ? `task ${taskId}` : "latest";
       source = new EventSource(url);
       const currentSource = source;
       source.addEventListener("snapshot", event => {
         if (currentSource !== source) return;
-        renderSnapshot(JSON.parse(event.data));
+        currentSnapshot = JSON.parse(event.data);
+        renderSnapshot(currentSnapshot);
       });
       source.addEventListener("log", event => {
         if (currentSource !== source) return;
@@ -299,6 +317,21 @@ def _logs_page() -> str:
         if (currentSource !== source) return;
         statusEl.textContent = "disconnected";
       };
+    }
+
+    async function fetchLog(taskId = "") {
+      const url = taskId ? `/logs/stream?events=1&task_id=${encodeURIComponent(taskId)}` : "/logs/stream?events=1";
+      statusEl.textContent = taskId ? `task ${taskId}` : "latest";
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        logEl.textContent = await response.text();
+        statusEl.textContent = "finished";
+        logEl.scrollTop = logEl.scrollHeight;
+      } catch (error) {
+        statusEl.textContent = "disconnected";
+        logEl.textContent = String(error);
+      }
     }
 
     function renderSnapshot(snapshot) {
@@ -325,9 +358,18 @@ def _logs_page() -> str:
             connect(task.id);
           });
         }
-        link.innerHTML = `<strong>${escapeHtml(task.project || "unknown")}</strong> <span class="meta">${escapeHtml(task.status || "")}</span><div class="meta">${escapeHtml(task.id || "")}</div><div class="meta">${escapeHtml(task.commit || task.finished_at || "")}</div>`;
+        link.innerHTML = `<strong>${escapeHtml(task.project || "unknown")}</strong> <span class="meta">${escapeHtml(task.status || "")}</span><div class="meta">${escapeHtml(task.id || "")}</div><div class="meta">${escapeHtml(task.finished_at || "")}</div>`;
         target.appendChild(link);
       }
+    }
+
+    function findTask(tasks, taskId) {
+      return tasks.find(task => task.id === taskId) || null;
+    }
+
+    function latestRunningTask() {
+      const running = currentSnapshot.running || [];
+      return running.length ? running[running.length - 1] : null;
     }
 
     function escapeHtml(value) {
@@ -338,3 +380,4 @@ def _logs_page() -> str:
   </script>
 </body>
 </html>"""
+    return html.replace("__INITIAL_SNAPSHOT__", initial_snapshot)
