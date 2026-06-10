@@ -104,6 +104,8 @@ def _stream_log_events(queue: DeploymentQueue, log_dir: Path, task_id: str | Non
             _task_log_stream(task, snapshot=snapshot),
             media_type="text/event-stream; charset=utf-8",
         )
+    if task is not None and task.logger is not None:
+        return _plain_log_response(task.logger.log_file)
 
     log_file = _latest_log_file(log_dir)
     if log_file is None:
