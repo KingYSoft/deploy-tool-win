@@ -1,0 +1,25 @@
+[project]
+name = "github-webhook-deployer"
+version = "0.1.0"
+description = "Windows-friendly GitHub webhook deployment service for Vue3 and .NET 8 projects."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "PyYAML>=6.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.24.0",
+  "httpx>=0.27.0",
+]
+
+[project.scripts]
+webhook-deployer = "webhook_deployer.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+

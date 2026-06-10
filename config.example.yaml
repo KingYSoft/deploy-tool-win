@@ -1,0 +1,34 @@
+server:
+  host: 0.0.0.0
+  port: 9000
+  log_dir: logs
+
+projects:
+  - name: frontend
+    repository: owner/frontend
+    type: vue3
+    branches: [main]
+    source_dir: D:/sites/frontend-src
+    webhook_secret: change-me
+    publish_dir: D:/sites/frontend
+    build_dir: dist
+    build_command: [yarn, build:test]
+    preserve_files:
+      - config.js
+    preserve_dirs:
+      - uploads
+
+  - name: api
+    repository: owner/api
+    type: dotnet8-webapi-service
+    branches: [production]
+    source_dir: D:/sites/api-src
+    webhook_secret: change-me-too
+    csproj: src/Api/Api.csproj
+    service_name: ApiService
+    publish_dir: D:/sites/api
+    preserve_files:
+      - appsettings.Production.json
+    preserve_dirs:
+      - logs
+      - uploads
